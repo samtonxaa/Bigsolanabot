@@ -2,7 +2,7 @@ import os
 import logging
 import json
 from datetime import datetime, timedelta
-from flask import Flask
+from flask import Flask, request
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -10,8 +10,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
-    ConversationHandler,
-    CallbackContext
+    ConversationHandler
 )
 
 # Enable logging
@@ -21,15 +20,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration
+# Configuration
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-PORT = int(os.environ.get('PORT', 5000))
+if not TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN environment variable is not set!")
+    # For development, you can hardcode it temporarily (remove in production)
+    # TOKEN = "YOUR_BOT_TOKEN_HERE"
+
+PORT = int(os.environ.get('PORT', 10000))
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
 
 # Conversation states
-ASKING_QUESTIONS, WAITING_FOR_ANSWER = range(2)
+ASKING_QUESTIONS = 1
 
-# Questions data - you can modify these
+# Questions data
 QUESTIONS = [
     {
         "question": "What's your age group?",
@@ -53,7 +57,7 @@ QUESTIONS = [
     }
 ]
 
-# User session storage (in production, use a database)
+# Simple in-memory storage (for production, use a database)
 user_sessions = {}
 
 class UserSession:
@@ -73,13 +77,26 @@ class UserSession:
             return True
         return False
 
+# Initialize Flask app
+app = Flask(__name__)
+
+# Initialize Telegram bot application
+try:
+    if TOKEN:
+        application = Application.builder().token(TOKEN).build()
+        logger.info("Telegram bot application initialized successfully")
+    else:
+        application = None
+        logger.error("Cannot initialize bot without token")
+except Exception as e:
+    logger.error(f"Failed to initialize bot: {e}")
+    application = None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start the conversation."""
     user_id = update.effective_user.id
     
     # Check if user completed recently
     if user_id in user_sessions and user_sessions[user_id].completed:
-        # Check if a week has passed
         last_session = user_sessions[user_id]
         time_since = datetime.now() - last_session.started_at
         
@@ -102,12 +119,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Let's get started with the first question:"
     )
     
-    # Ask first question
     await ask_question(update, context)
     return ASKING_QUESTIONS
 
-async def ask_question(update: Update, context: CallbackContext):
-    """Ask the current question."""
+async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if user_id not in user_sessions:
@@ -133,7 +148,6 @@ async def ask_question(update: Update, context: CallbackContext):
         )
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle user's answer."""
     user_id = update.effective_user.id
     
     if user_id not in user_sessions:
@@ -143,7 +157,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.message.text
     session = user_sessions[user_id]
     
-    # Validate answer is from options
+    # Validate answer
     current_options = QUESTIONS[session.current_question]["options"]
     if answer not in current_options:
         await update.message.reply_text("Please select one of the provided options.")
@@ -157,7 +171,6 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
     
     if is_completed:
-        # All questions answered
         await update.message.reply_text(
             "✅ **Thank you for completing all questions!**\n\n"
             "Your answers have been recorded successfully.\n\n"
@@ -166,17 +179,13 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=None
         )
         
-        # You could save data to a database here
-        logger.info(f"User {user_id} completed survey: {json.dumps(session.answers)}")
-        
+        logger.info(f"User {user_id} completed survey")
         return ConversationHandler.END
     else:
-        # Ask next question
         await ask_question(update, context)
         return ASKING_QUESTIONS
 
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Review previous answers."""
     user_id = update.effective_user.id
     
     if user_id not in user_sessions or not user_sessions[user_id].answers:
@@ -196,34 +205,52 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         time_since = datetime.now() - session.started_at
         days_left = max(0, 7 - time_since.days)
         answers_text += f"⏳ **Next survey available in:** {days_left} day{'s' if days_left != 1 else ''}"
-    else:
-        answers_text += "You can continue with /continue"
     
     await update.message.reply_text(answers_text, parse_mode='Markdown')
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel the conversation."""
     await update.message.reply_text(
         "Survey cancelled. You can start again anytime with /start"
     )
     return ConversationHandler.END
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors."""
-    logger.error(f"Update {update} caused error {context.error}")
-    return ConversationHandler.END
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 **Marketing Survey Bot Help**\n\n"
+        "Available commands:\n"
+        "/start - Start the survey\n"
+        "/review - Review your answers\n"
+        "/help - Show this help message\n\n"
+        "The survey has 5 questions and takes about 1 minute to complete."
+    )
 
-# Flask app for Render
-app = Flask(__name__)
-
+# Flask routes
 @app.route('/')
-def index():
-    return "Telegram Bot is running!"
+def home():
+    return "Telegram Marketing Bot is running! ✅"
 
-def main():
-    """Start the bot."""
-    # Create the Application
-    application = Application.builder().token(TOKEN).build()
+@app.route('/health')
+def health():
+    return {"status": "healthy", "bot_initialized": application is not None}
+
+@app.route(f'/webhook/{TOKEN}' if TOKEN else '/webhook', methods=['POST'])
+async def webhook():
+    """Handle incoming updates from Telegram"""
+    if application is None:
+        return "Bot not initialized", 500
+    
+    update = Update.de_json(await request.get_json(), application.bot)
+    
+    # Process the update
+    await application.process_update(update)
+    
+    return 'ok'
+
+def setup_bot():
+    """Setup bot handlers and webhook"""
+    if application is None:
+        logger.error("Cannot setup bot without token")
+        return
     
     # Add conversation handler
     conv_handler = ConversationHandler(
@@ -238,32 +265,38 @@ def main():
     
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('review', review))
-    application.add_handler(CommandHandler('help', start))
+    application.add_handler(CommandHandler('help', help_command))
+    application.add_handler(CommandHandler('start', start))
     
-    # Add error handler
-    application.add_error_handler(error_handler)
+    # Set webhook if WEBHOOK_URL is provided
+    if WEBHOOK_URL and TOKEN:
+        webhook_url = f"{WEBHOOK_URL}/webhook/{TOKEN}"
+        logger.info(f"Setting webhook to: {webhook_url}")
+        
+        # Run in async context
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def set_webhook_async():
+            await application.bot.set_webhook(url=webhook_url)
+            logger.info("Webhook set successfully")
+        
+        loop.run_until_complete(set_webhook_async())
+
+@app.route('/set_webhook')
+def set_webhook_route():
+    """Manually trigger webhook setup"""
+    if not TOKEN:
+        return "Bot token not set", 400
     
-    # Start the bot
-    if WEBHOOK_URL:
-        # Webhook mode for production
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
-        )
-    else:
-        # Polling mode for development
-        application.run_polling()
+    setup_bot()
+    return "Webhook setup triggered"
 
 if __name__ == '__main__':
-    # Run Flask app and bot in separate threads
-    from threading import Thread
-    
-    # Start bot in a separate thread
-    bot_thread = Thread(target=main)
-    bot_thread.daemon = True
-    bot_thread.start()
+    # Setup bot handlers
+    if application:
+        setup_bot()
     
     # Start Flask app
-    app.run(host='0.0.0.0', port=PORT)
+    app.run(host='0.0.0.0', port=PORT, debug=False)
